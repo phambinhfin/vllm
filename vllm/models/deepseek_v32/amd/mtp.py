@@ -10,7 +10,6 @@ import torch.nn as nn
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
-from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -41,6 +40,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
+from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.deepseek_v32.common.kernels import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -97,9 +97,10 @@ class DeepseekV32MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = residual + hidden_states
-        hidden_states = self.shared_head.norm(hidden_states)
+        # The MoE output is left un-reduced; fold its all-reduce into the final norm.
+        hidden_states, _ = fused_allreduce_rms_norm(
+            hidden_states, residual, self.shared_head.norm
+        )
         return hidden_states, hidden_states
 
 
@@ -164,14 +165,29 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
             current_step_idx,
         )
 
+    def _shared_head(self, spec_step_idx: int) -> SharedHead:
+        """The shared head owning the LM head for this draft step."""
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)].shared_head
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        return self.logits_processor(
+            self._shared_head(spec_step_idx).head, hidden_states
+        )
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Protocol probed by ``use_local_argmax_reduction``."""
+        return self.logits_processor.get_top_tokens(
+            self._shared_head(spec_step_idx).head, hidden_states
+        )
 
 
 class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
@@ -228,6 +244,14 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """See ``DeepseekV32MultiTokenPredictor.get_top_tokens``."""
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         spec_layer_weight_names = [
