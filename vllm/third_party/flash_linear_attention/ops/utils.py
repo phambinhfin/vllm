@@ -159,6 +159,11 @@ is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in current_platform.get_device_name(0)
     or current_platform.get_device_capability(0).major >= 9
 )
+is_gfx942 = False
+if is_amd:
+    from vllm.platforms.rocm import on_gfx942
+
+    is_gfx942 = on_gfx942()
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
 is_tma_supported = (
