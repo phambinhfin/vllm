@@ -63,6 +63,8 @@ ALONE_C = tl.constexpr(-6)  # row is cut by one program
 GATHER_SCAN = tl.constexpr(current_platform.is_rocm())
 # ROCm: each acquire poll invalidates caches that the programs still working rely on.
 RELAXED_POLL = tl.constexpr(current_platform.is_rocm())
+# ROCm: tl.histogram is slow there, so top-k rows pick their tier's items by sorting.
+EXACT_PICK = tl.constexpr(current_platform.is_rocm())
 # Span flags: the row's top-k is cut first (its p waits), then its top-p alone.
 K_FIRST = tl.constexpr(1)
 P_AFTER_K = tl.constexpr(2)
@@ -727,7 +729,10 @@ def _tier(
     s = tl.arange(0, SUPERGROUPS_P2)
     in_row = s < supergroups
     level2 = tl.load(level2_row + s, mask=in_row, other=-float("inf"), volatile=True)
-    ok, top2, count2 = _pick(level2, s, in_row, need, row_max, scratch, C)
+    if EXACT_PICK & (C <= 128) & use_k:
+        ok, top2, count2 = _pick_exact(level2, s, in_row, need, C)
+    else:
+        ok, top2, count2 = _pick(level2, s, in_row, need, row_max, scratch, C)
     rank = tl.arange(0, C)
     group = tl.reshape(top2[:, None] * 16 + tl.arange(0, 16)[None, :], [C * 16])
     in_row = tl.reshape(
@@ -736,13 +741,19 @@ def _tier(
     level1 = tl.load(
         level1_row + group, mask=in_row, other=-float("inf"), volatile=True
     )
-    ok1, top1, count1 = _pick(level1, group, in_row, need, row_max, scratch + C, C)
+    if EXACT_PICK & (C <= 128) & use_k:
+        ok1, top1, count1 = _pick_exact(level1, group, in_row, need, C)
+    else:
+        ok1, top1, count1 = _pick(level1, group, in_row, need, row_max, scratch + C, C)
     index = tl.reshape(top1[:, None] * 16 + tl.arange(0, 16)[None, :], [C * 16])
     in_row = tl.reshape(
         (rank < count1)[:, None] & (tl.arange(0, 16) >= 0)[None, :], [C * 16]
     ) & (index < vocab)
     x = tl.load(row_ptr + index, mask=in_row, other=-float("inf"))
-    ok0, top0, count0 = _pick(x, index, in_row, need, row_max, scratch + 2 * C, C)
+    if EXACT_PICK & (C <= 128) & use_k:
+        ok0, top0, count0 = _pick_exact(x, index, in_row, need, C)
+    else:
+        ok0, top0, count0 = _pick(x, index, in_row, need, row_max, scratch + 2 * C, C)
     ok = ok & ok1 & ok0
     valid = rank < count0
     xs = tl.load(row_ptr + top0, mask=valid, other=-float("inf"))
@@ -793,6 +804,16 @@ def _pick(values, items, mask, need, row_max, slots, C: tl.constexpr):
     picked = tl.load(slots + rank, mask=rank < count, other=0).to(tl.int32)
     tl.debug_barrier()
     return (count >= need) & (count <= C), picked, count
+
+
+@triton.jit
+def _pick_exact(values, items, mask, need, C: tl.constexpr):
+    """The C best items by key (never NaN), whether need of them exist, and count."""
+    live = mask & (values == values)
+    keys = tl.where(live, _key(values, items), 0x7FFFFFFFFFFFFFFF)
+    best = ~tl.topk(~keys, C)
+    count = tl.minimum(tl.sum(live.to(tl.int32)), C)
+    return count >= need, (best & 0xFFFFFFFF).to(tl.int32), count
 
 
 @triton.jit
