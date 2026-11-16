@@ -99,9 +99,8 @@ def _pinned(name, configs):
         tuner.cache.update(saved_cache)
 
 
-def _inputs(hg, h, device="cuda"):
+def _inputs(hg, h, dtype, device="cuda"):
     set_random_seed(0)
-    dtype = torch.bfloat16
     total = sum(SEQ_LENS)
     cu = torch.zeros(len(SEQ_LENS) + 1, dtype=torch.int32)
     cu[1:] = torch.tensor(SEQ_LENS, dtype=torch.int32).cumsum(0)
@@ -157,29 +156,31 @@ def _gfx_pin_sets(names, kernel_name):
     ]
 
 
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
 @pytest.mark.skipif(not is_cdna3, reason="gfx942-specific configs")
+@pytest.mark.parametrize("dtype", list(DTYPES))
 @pytest.mark.parametrize("shape", list(SHAPES))
 @pytest.mark.parametrize("kernel_name", [*KERNELS, "all"])
 @torch.inference_mode()
-def test_gfx942_config_matches_stock(kernel_name, shape):
+def test_gfx942_config_matches_stock(kernel_name, shape, dtype):
     """Each gfx942 config, and every launch-time choice, reproduces stock output."""
     hg, h = SHAPES[shape]
-    inputs = _inputs(hg, h)
+    inputs = _inputs(hg, h, DTYPES[dtype])
     ref_out, ref_state = _run(inputs, _stock_pins(KERNELS))
     for i, pins in enumerate(_gfx_pin_sets(list(KERNELS), kernel_name)):
         out, state = _run(inputs, pins)
-        assert torch.equal(ref_out, out), f"{kernel_name}[{i}]/{shape}: output changed"
-        assert torch.equal(ref_state, state), (
-            f"{kernel_name}[{i}]/{shape}: final state changed"
-        )
+        tag = f"{kernel_name}[{i}]/{shape}/{dtype}"
+        assert torch.equal(ref_out, out), f"{tag}: output changed"
+        assert torch.equal(ref_state, state), f"{tag}: final state changed"
 
 
 _KDA_SHARED = ["chunk_delta_h", "solve_tril_merge64"]
 
 
-def _kda_inputs(h, device="cuda"):
+def _kda_inputs(h, dtype, device="cuda"):
     set_random_seed(0)
-    dtype = torch.bfloat16
     total = sum(SEQ_LENS)
     cu = torch.zeros(len(SEQ_LENS) + 1, dtype=torch.int32)
     cu[1:] = torch.tensor(SEQ_LENS, dtype=torch.int32).cumsum(0)
@@ -203,21 +204,22 @@ def _kda_inputs(h, device="cuda"):
 
 
 @pytest.mark.skipif(not is_cdna3, reason="gfx942-specific configs")
+@pytest.mark.parametrize("dtype", list(DTYPES))
 @pytest.mark.parametrize("h", [8, 32])
 @pytest.mark.parametrize("kernel_name", [*_KDA_SHARED, "all"])
 @torch.inference_mode()
-def test_gfx942_config_matches_stock_on_kda(kernel_name, h):
+def test_gfx942_config_matches_stock_on_kda(kernel_name, h, dtype):
     """The two configs shared with KDA reproduce stock output on its path too."""
     from vllm.third_party.flash_linear_attention.ops.kda import chunk_kda
 
+    td = DTYPES[dtype]
     # chunk_kda consumes v in place, so every call needs fresh inputs.
-    ref_out, ref_state = _run(_kda_inputs(h), _stock_pins(_KDA_SHARED), chunk_kda)
+    ref_out, ref_state = _run(_kda_inputs(h, td), _stock_pins(_KDA_SHARED), chunk_kda)
     for i, pins in enumerate(_gfx_pin_sets(_KDA_SHARED, kernel_name)):
-        out, state = _run(_kda_inputs(h), pins, chunk_kda)
-        assert torch.equal(ref_out, out), f"kda/{kernel_name}[{i}]/h{h}: output changed"
-        assert torch.equal(ref_state, state), (
-            f"kda/{kernel_name}[{i}]/h{h}: final state changed"
-        )
+        out, state = _run(_kda_inputs(h, td), pins, chunk_kda)
+        tag = f"kda/{kernel_name}[{i}]/h{h}/{dtype}"
+        assert torch.equal(ref_out, out), f"{tag}: output changed"
+        assert torch.equal(ref_state, state), f"{tag}: final state changed"
 
 
 TUNED_BV = chunk_delta_h._FWD_H_CDNA3.kwargs["BV"]
