@@ -19,6 +19,8 @@ from vllm.third_party.flash_linear_attention.ops import (
 )
 from vllm.third_party.flash_linear_attention.ops.chunk import chunk_gated_delta_rule
 from vllm.third_party.flash_linear_attention.ops.utils import is_cdna3
+from vllm.triton_utils import triton
+from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import set_random_seed
 
 # kernel label -> (kernel, gfx942 configs, stock configs)
@@ -216,3 +218,83 @@ def test_gfx942_config_matches_stock_on_kda(kernel_name, h):
         assert torch.equal(ref_state, state), (
             f"kda/{kernel_name}[{i}]/h{h}: final state changed"
         )
+
+
+TUNED_BV = chunk_delta_h._FWD_H_CDNA3.kwargs["BV"]
+PICK_KEY = ("test",)
+STOCK_BV64 = [c for c in chunk_delta_h._FWD_H_STOCK if c.kwargs["BV"] == 64]
+STOCK_BV32 = [c for c in chunk_delta_h._FWD_H_STOCK if c.kwargs["BV"] == TUNED_BV]
+
+
+@contextlib.contextmanager
+def _fwd_h_pick(cfg):
+    saved = dict(chunk_delta_h._FWD_H_PICK)
+    chunk_delta_h._FWD_H_PICK.clear()
+    if cfg is not None:
+        chunk_delta_h._FWD_H_PICK[PICK_KEY] = cfg
+    try:
+        yield
+    finally:
+        chunk_delta_h._FWD_H_PICK.clear()
+        chunk_delta_h._FWD_H_PICK.update(saved)
+
+
+def _gate(V, num_seq_heads):
+    return chunk_delta_h._fwd_h_cdna3_config(V, num_seq_heads, 0, PICK_KEY)
+
+
+@pytest.mark.skipif(not is_cdna3, reason="gfx942-specific configs")
+@pytest.mark.parametrize("V", [32, 64, 96, 128, 192])
+def test_fwd_h_gate_defers_before_the_key_is_tuned(V):
+    """With no cached pick the gate returns None, so the stock autotuner runs."""
+    cu = num_compute_units(0)
+    with _fwd_h_pick(None):
+        for num_seq_heads in (1, 8, cu, 4 * cu):
+            assert _gate(V, num_seq_heads) is None
+
+
+@pytest.mark.skipif(not is_cdna3, reason="gfx942-specific configs")
+@pytest.mark.parametrize("V", [32, 64, 96, 128, 192])
+@pytest.mark.parametrize("stock", STOCK_BV32, ids=lambda c: f"w{c.num_warps}")
+def test_fwd_h_gate_keeps_tuned_config_for_a_bv32_pick(V, stock):
+    """A stock BV=32 pick takes the tuned config at every grid size."""
+    cu = num_compute_units(0)
+    with _fwd_h_pick(stock):
+        for num_seq_heads in (1, 8, cu - 1, cu, cu + 1, 4 * cu):
+            cfg = _gate(V, num_seq_heads)
+            assert cfg is chunk_delta_h._FWD_H_CDNA3, (V, num_seq_heads, cfg)
+
+
+@pytest.mark.skipif(not is_cdna3, reason="gfx942-specific configs")
+@pytest.mark.parametrize("V", [32, 64, 96, 128, 192])
+@pytest.mark.parametrize("stock", STOCK_BV64, ids=lambda c: f"w{c.num_warps}")
+def test_fwd_h_gate_falls_back_to_stock_above_the_cu_count(V, stock):
+    """A stock BV=64 pick is kept once the tuned BV=32 grid exceeds the CUs."""
+    cu = num_compute_units(0)
+    per_seq_head = triton.cdiv(V, TUNED_BV)
+    boundary = cu // per_seq_head
+    probes = {1, boundary - 1, boundary, boundary + 1, 4 * cu}
+    with _fwd_h_pick(stock):
+        for num_seq_heads in sorted(n for n in probes if n >= 1):
+            cfg = _gate(V, num_seq_heads)
+            fits = per_seq_head * num_seq_heads <= cu
+            assert cfg is (chunk_delta_h._FWD_H_CDNA3 if fits else stock), (
+                V,
+                num_seq_heads,
+                cu,
+                cfg,
+            )
+
+
+@pytest.mark.skipif(not is_cdna3, reason="gfx942-specific configs")
+@pytest.mark.parametrize("V", [33, 65, 97, 129])
+def test_fwd_h_gate_counts_a_partial_tile_as_a_program(V):
+    """V not divisible by BV rounds the grid up, so the switch happens earlier."""
+    cu = num_compute_units(0)
+    per_seq_head = triton.cdiv(V, TUNED_BV)
+    assert per_seq_head == -(-V // TUNED_BV)
+    stock = STOCK_BV64[0]
+    with _fwd_h_pick(stock):
+        fits = cu // per_seq_head
+        assert _gate(V, fits) is chunk_delta_h._FWD_H_CDNA3
+        assert _gate(V, fits + 1) is stock
