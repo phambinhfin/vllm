@@ -8,8 +8,16 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -59,9 +67,7 @@ def _kkt_cdna3_config(tokens_heads: int) -> triton.Config:
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@autotune_unless_cdna3(
-    configs=_KKT_STOCK, key=["H", "K", "BT", "IS_VARLEN"], cdna3_configs=_KKT_CDNA3
-)
+@autotune_unless_cdna3(configs=_KKT_STOCK, key=["H", "K", "BT", "IS_VARLEN"])
 @triton.jit(do_not_specialize=["T"])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
@@ -125,6 +131,73 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), mask=m_t[:, None])
 
 
+def _chunk_kkt_warmup_inputs(
+    *,
+    dtype: torch.dtype,
+    H: int,
+    Hg: int,
+    K: int,
+    BT: int = FLA_CHUNK_SIZE,
+    output_dtype: torch.dtype = torch.float32,
+) -> dict[str, Any]:
+    # Straddles the threshold in _kkt_cdna3_config so both configs are compiled.
+    tokens_heads: Any = WarmupChoices(1, 65537)
+    return dict(
+        k=TritonWarmupTensor(dtype, shape=(1, BT, Hg, K)),
+        g=TritonWarmupTensor(torch.float32, shape=(1, BT, H)),
+        beta=TritonWarmupTensor(dtype, shape=(1, BT, H)),
+        A=TritonWarmupTensor(output_dtype, shape=(1, BT, H, BT)),
+        cu_seqlens=None,
+        chunk_indices=None,
+        T=BT,
+        H=H,
+        Hg=Hg,
+        K=K,
+        BT=BT,
+        num_chunks=1,
+        num_batch_heads=H,
+        tokens_heads=tokens_heads,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=chunk_scaled_dot_kkt_fwd_kernel,
+    warmup_inputs=_chunk_kkt_warmup_inputs,
+)
+def _chunk_scaled_dot_kkt_launch(
+    k: Any,
+    g: Any,
+    beta: Any,
+    A: Any,
+    cu_seqlens: Any,
+    chunk_indices: Any,
+    T: int,
+    H: int,
+    Hg: int,
+    K: int,
+    BT: int,
+    num_chunks: int,
+    num_batch_heads: int,
+    tokens_heads: int,
+) -> DispatchSpec:
+    launch = {}
+    if is_cdna3:
+        launch = _kkt_cdna3_config(tokens_heads).all_kwargs()
+    return (
+        (num_chunks, num_batch_heads),
+        dict(
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            BT=BT,
+            CAST_DOT_TO_K_DTYPE=_CAST_DOT_TO_K_DTYPE,
+            **launch,
+        ),
+        A,
+    )
+
+
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     g: torch.Tensor | None = None,
@@ -167,15 +240,11 @@ def chunk_scaled_dot_kkt_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    launch = {}
-    if is_cdna3:
-        launch = _kkt_cdna3_config(B * T * H).all_kwargs()
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
+    return _chunk_scaled_dot_kkt_launch(
         k=k,
         g=g,
         beta=beta,
-        A=A,
+        A=torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype),
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
@@ -183,6 +252,7 @@ def chunk_scaled_dot_kkt_fwd(
         Hg=Hg,
         K=K,
         BT=BT,
-        **launch,
+        num_chunks=NT,
+        num_batch_heads=B * H,
+        tokens_heads=B * T * H,
     )
-    return A

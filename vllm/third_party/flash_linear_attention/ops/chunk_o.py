@@ -10,8 +10,16 @@
 # ruff: noqa: E501
 
 
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
 
@@ -62,9 +70,7 @@ def _fwd_o_cdna3_config(V: int, chunk_heads: int, device: int) -> triton.Config:
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@autotune_unless_cdna3(
-    configs=_FWD_O_STOCK, key=["H", "K", "V", "BT"], cdna3_configs=_FWD_O_CDNA3
-)
+@autotune_unless_cdna3(configs=_FWD_O_STOCK, key=["H", "K", "V", "BT"])
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -162,6 +168,69 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
+def _chunk_fwd_o_warmup_inputs(
+    *, dtype: torch.dtype, H: int, Hg: int, K: int, V: int, BT: int = FLA_CHUNK_SIZE
+) -> dict[str, Any]:
+    # Straddles the threshold in _fwd_o_cdna3_config so both configs are compiled.
+    num_batch_heads: Any = WarmupChoices(1, num_compute_units(0))
+    return dict(
+        q=TritonWarmupTensor(dtype, shape=(1, BT, Hg, K)),
+        k=TritonWarmupTensor(dtype, shape=(1, BT, Hg, K)),
+        v=TritonWarmupTensor(dtype, shape=(1, BT, H, V)),
+        h=TritonWarmupTensor(dtype, shape=(1, 1, H, V, K)),
+        g=TritonWarmupTensor(torch.float32, shape=(1, BT, H)),
+        o=TritonWarmupTensor(dtype, shape=(1, BT, H, V)),
+        cu_seqlens=None,
+        chunk_indices=None,
+        scale=K**-0.5,
+        T=BT,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        num_chunks=1,
+        num_batch_heads=num_batch_heads,
+        device=0,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=chunk_fwd_kernel_o,
+    warmup_inputs=_chunk_fwd_o_warmup_inputs,
+)
+def _chunk_fwd_o_launch(
+    q: Any,
+    k: Any,
+    v: Any,
+    h: Any,
+    g: Any,
+    o: Any,
+    cu_seqlens: Any,
+    chunk_indices: Any,
+    scale: float,
+    T: int,
+    H: int,
+    Hg: int,
+    K: int,
+    V: int,
+    BT: int,
+    num_chunks: int,
+    num_batch_heads: int,
+    device: int,
+) -> DispatchSpec:
+    launch = {}
+    if is_cdna3:
+        launch = _fwd_o_cdna3_config(
+            V, num_chunks * num_batch_heads, device
+        ).all_kwargs()
+
+    def grid(meta):
+        return (triton.cdiv(V, meta["BV"]), num_chunks, num_batch_heads)
+
+    return grid, dict(T=T, H=H, Hg=Hg, K=K, V=V, BT=BT, **launch), o
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -191,28 +260,23 @@ def chunk_fwd_o(
     else:
         o = torch.empty_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
-
-    launch = {}
-    if is_cdna3:
-        launch = _fwd_o_cdna3_config(V, NT * B * H, q.device.index).all_kwargs()
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
+    return _chunk_fwd_o_launch(
+        q=q,
+        k=k,
+        v=v,
+        h=h,
+        g=g,
+        o=o,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
         T=T,
         H=H,
         Hg=Hg,
         K=K,
         V=V,
         BT=BT,
-        **launch,
+        num_chunks=NT,
+        num_batch_heads=B * H,
+        device=q.device.index,
     )
-    return o

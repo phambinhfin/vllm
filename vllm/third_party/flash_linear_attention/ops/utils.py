@@ -210,12 +210,12 @@ def compile_on_first_launch(cdna3_configs: list):
     return wrap
 
 
-def autotune_unless_cdna3(configs: list, key: list[str], cdna3_configs=(), **kwargs):
-    """triton.autotune; on gfx942 the caller launches one of `cdna3_configs`."""
+def autotune_unless_cdna3(configs: list, key: list[str], **kwargs):
+    """triton.autotune; on gfx942 the caller picks the config per launch."""
 
     def wrap(fn):
         if is_cdna3:
-            return compile_on_first_launch(cdna3_configs)(fn)
+            return fn
         return triton.autotune(configs=configs, key=key, **kwargs)(fn)
 
     return wrap
