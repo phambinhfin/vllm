@@ -15,7 +15,7 @@ from vllm.utils.platform_utils import num_compute_units
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
-from .utils import FLA_CHUNK_SIZE, compile_on_first_launch, is_cdna3, use_cuda_graph
+from .utils import FLA_CHUNK_SIZE, is_cdna3, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
@@ -64,7 +64,6 @@ _FWD_H_HEURISTICS = {
 @triton.autotune(
     configs=_FWD_H_STOCK, key=["H", "K", "V", "BT"], use_cuda_graph=use_cuda_graph
 )
-@compile_on_first_launch([_FWD_H_CDNA3])
 @triton.jit(
     do_not_specialize=["T"],
     do_not_specialize_on_alignment=["cu_seqlens", "chunk_offsets", "checkpoint_offsets"],
@@ -396,7 +395,7 @@ def chunk_gated_delta_rule_fwd_h(
         cfg = _fwd_h_cdna3_config(V, N * H, k.device.index, key)
         if cfg is not None:
             kernel, launch = _fwd_h_kernel_cdna3, cfg.all_kwargs()
-    kernel[grid](
+    args = dict(
         k=k,
         v=u,
         w=w,
@@ -417,8 +416,10 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
-        **launch,
     )
+    kernel[grid](**args, **launch)
     if is_cdna3 and cfg is None:
         _FWD_H_PICK[key] = _FWD_H_TUNER.best_config
+        # The next launch for this key may use it, so compile it now.
+        _fwd_h_kernel_cdna3.warmup(grid=grid, **args, **_FWD_H_CDNA3.all_kwargs())
     return h, v_new, final_state
