@@ -18,22 +18,11 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_kernel_dispatcher_with_warmup,
 )
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
 from .utils import FLA_CHUNK_SIZE, autotune_unless_cdna3, is_cdna3
-
-# On RDNA (gfx11xx/gfx12xx) WMMA only
-# accepts 16-bit/int inputs, so a widened (e.g. fp32) tl.dot is lowered to a
-# software matmul (~190x amdgcn-stage blowup). There we cast both operands down
-# to k's native storage dtype (bf16/fp16) so fast WMMA is used instead.
-_CAST_DOT_TO_K_DTYPE = False
-if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx1x
-
-    _CAST_DOT_TO_K_DTYPE = on_gfx1x()
 
 _KKT_STOCK = [
     triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
@@ -191,7 +180,6 @@ def _chunk_scaled_dot_kkt_launch(
             Hg=Hg,
             K=K,
             BT=BT,
-            CAST_DOT_TO_K_DTYPE=_CAST_DOT_TO_K_DTYPE,
             **launch,
         ),
         A,
